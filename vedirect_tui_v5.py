@@ -102,10 +102,11 @@ REGISTERS = [
     # Battery settings
     Register(0xEDF0, "Max Charge Current", "Maximum battery charge current",       "A",    0.1,   "RW", "d", 2),
     Register(0xEDF1, "Battery Type",       "Battery type (0xFF=user defined)",     "",     1,     "RW", "d", 1,
-             {0:"User defined", 1:"Gel Victron Long Life",
-              2:"Gel Victron Deep Discharge", 3:"Gel Victron Deep Discharge (2)",
-              4:"AGM Victron Deep Discharge", 5:"Tubular Plate Traction Gel",
-              6:"OPzS", 7:"OPzV", 8:"OPzS VRLA", 255:"User defined (custom)"}),
+             {0:"User defined", 1:"Gel long life / OPzV",
+              2:"Gel / AGM deep discharge", 3:"Default / Gel / AGM DD",
+              4:"AGM spiral / OPzS / Rolls AGM", 5:"PzS traction / OPzS (low)",
+              6:"PzS traction / OPzS (mid)", 7:"PzS traction / OPzS (high)",
+              8:"LiFePO4", 255:"User defined (custom)"}),
     Register(0xEDF2, "Temp Compensation",  "Battery temp compensation",            "mV/K", 0.01,  "RW", "d", 2),
     Register(0xEDF4, "Equalise Voltage",   "Equalisation voltage",                 "V",    0.01,  "RW", "d", 2),
     Register(0xEDF6, "Float Voltage",      "Float phase target voltage",           "V",    0.01,  "RW", "d", 2),
@@ -137,7 +138,8 @@ TABS = [
     ("ettings", "S", [0xEDF0, 0xEDF1, 0xEDF7, 0xEDF6, 0xEDF4, 0xEDF2,
                        0xEDEA, 0xEDFB, 0xEDFC, 0xEDFD, 0xEDFE,
                        0xED2E, 0xEDA8, 0xEDA9, 0xEDAA,
-                       0xEDEF]),   # read-only battery voltage last, no number
+                       0xEDEF]),
+    ("raph",    "G", []),   # daily yield bar chart — data fetched on demand
 ]
 TAB_KEYS = {t[1].lower(): i for i, t in enumerate(TABS)}
 
@@ -216,14 +218,12 @@ LEADACID_RANGES = {
 def get_current_algorithm(hex_cache: dict) -> Optional[Algorithm]:
     """
     Infer current algorithm from cached register values.
-    Checks absorption and float voltages against known presets.
-    Returns None if unknown / not yet loaded.
+    Matches absorption and float voltages against known presets.
+    Returns Custom if no match found.
     """
     abs_str   = hex_cache.get(0xEDF7, "")
     float_str = hex_cache.get(0xEDF6, "")
-    eq_str    = hex_cache.get(0xEDF4, "")
 
-    # Try to parse the cached display strings back to floats
     def parse_v(s):
         try:
             return float(s.split()[0])
@@ -236,18 +236,47 @@ def get_current_algorithm(hex_cache: dict) -> Optional[Algorithm]:
     if abs_v is None or float_v is None:
         return None
 
-    # Match against known presets (within 0.05V tolerance)
     for alg in ALGORITHMS:
         if alg.is_custom:
             continue
-        if alg.is_lithium:
-            if abs(abs_v - alg.absorption) < 0.05 and abs(float_v - alg.float_v) < 0.05:
-                return alg
-        else:
-            if abs(abs_v - alg.absorption) < 0.05 and abs(float_v - alg.float_v) < 0.05:
-                return alg
+        if abs(abs_v - alg.absorption) < 0.05 and abs(float_v - alg.float_v) < 0.05:
+            return alg
 
     return ALGORITHMS[8]  # custom / user defined
+
+
+def get_battery_type_display(hex_cache: dict) -> str:
+    """
+    Returns a human-readable battery type string.
+    If type is 255 (user defined), infer algorithm from voltages.
+    """
+    btype_str = hex_cache.get(0xEDF1, "")
+    try:
+        btype = int(btype_str.split()[0])
+    except Exception:
+        return btype_str
+
+    if btype != 255:
+        # Rotary switch preset — map to algorithm name
+        ALG_NAMES = {
+            1: "Pos 0: Gel long life / OPzV",
+            2: "Pos 1: Gel / AGM deep discharge",
+            3: "Pos 2: Default / Gel / AGM DD",
+            4: "Pos 3: AGM spiral / OPzS",
+            5: "Pos 4: PzS traction / OPzS (low)",
+            6: "Pos 5: PzS traction / OPzS (mid)",
+            7: "Pos 6: PzS traction / OPzS (high)",
+            8: "Pos 7: LiFePO4",
+        }
+        return ALG_NAMES.get(btype, f"Preset {btype}")
+
+    # Type 255 = user defined — infer from voltages
+    alg = get_current_algorithm(hex_cache)
+    if alg is None:
+        return "User defined (detecting...)"
+    if alg.is_custom:
+        return "User defined (custom)"
+    return f"User defined — matches pos {alg.position}: {alg.name}"
 
 def is_register_locked(addr: int, alg: Optional[Algorithm]) -> bool:
     """Return True if this register should be blocked for the current algorithm."""
@@ -626,8 +655,11 @@ class State:
         self.live_updated = 0.0
         self.hex_cache    = {}
         self.hex_loading  = set()
-        self.hex_retries  = {}   # addr -> number of failed fetch attempts
+        self.hex_retries  = {}
         self.write_log    = []
+        self.graph_data   = []     # list of (day_offset, yield_wh, max_power_w)
+        self.graph_loading = False
+        self.graph_updated = 0.0
 
 # ─────────────────────────────────────────────
 #  Background threads
@@ -706,6 +738,163 @@ def auto_refetch_thread(worker: SerialWorker, state: State,
                     state.hex_retries[addr] = state.hex_retries.get(addr, 0) + 1
                     if state.hex_retries[addr] >= MAX_RETRIES:
                         state.hex_cache[addr] = "unavailable"
+
+def graph_fetch_thread(worker: SerialWorker, state: State,
+                       stop_event: threading.Event):
+    """
+    Fetches 30-day history from registers 0x104F (count) + 0x1050-0x106E.
+    Each day record is a 34-byte block. We extract yield (bytes 2-3, un16,
+    scale 10Wh) and max power (bytes 4-5, un16, scale 1W).
+    """
+    with state.lock:
+        state.graph_loading = True
+
+    worker.ping()
+    days = []
+
+    # Fetch up to 30 day records (0x1050 = today-1, 0x1051 = today-2, etc.)
+    for i in range(30):
+        if stop_event.is_set():
+            break
+        addr = 0x1050 + i
+        reg_lo = addr & 0xFF
+        reg_hi = (addr >> 8) & 0xFF
+        cs = (0x55 - (0x07 + reg_lo + reg_hi)) & 0xFF
+        frame = f":7{reg_lo:02X}{reg_hi:02X}{cs:02X}\n".encode()
+
+        worker.ping()
+        val_bytes = worker.get_register(addr, retries=2)
+
+        if val_bytes is None or len(val_bytes) < 6:
+            break  # no more data
+
+        # Parse day record: bytes 0-1 = day seq, 2-3 = yield (×10 Wh), 4-5 = max pwr (W)
+        yield_wh  = int.from_bytes(val_bytes[2:4], 'little') * 10
+        max_power = int.from_bytes(val_bytes[4:6], 'little')
+        days.append((i + 1, yield_wh, max_power))
+
+    with state.lock:
+        state.graph_data    = days
+        state.graph_loading = False
+        state.graph_updated = time.time()
+
+
+def draw_graph_tab(win, state: State, rows: int, cols: int):
+    """Draw a bar chart of daily yield (Wh) for up to 30 days."""
+    with state.lock:
+        data    = list(state.graph_data)
+        loading = state.graph_loading
+        updated = state.graph_updated
+
+    if loading:
+        try:
+            win.addstr(3, 2, "Loading 30-day history...", curses.color_pair(C_DIM))
+        except curses.error:
+            pass
+        return
+
+    if not data:
+        try:
+            win.addstr(3, 2, "No history data. Press R to fetch.",
+                       curses.color_pair(C_DIM))
+        except curses.error:
+            pass
+        return
+
+    # Chart dimensions
+    chart_top    = 3
+    chart_bottom = rows - 4
+    chart_height = chart_bottom - chart_top
+    chart_left   = 8     # space for Y axis labels
+    chart_right  = cols - 2
+    chart_width  = chart_right - chart_left
+
+    if chart_height < 4 or chart_width < 10:
+        return
+
+    # Find max value for scaling
+    max_wh = max(d[1] for d in data) if data else 1
+    if max_wh == 0:
+        max_wh = 1
+
+    bar_count = min(len(data), chart_width // 3)
+    bar_width = max(1, chart_width // bar_count - 1)
+    visible   = data[:bar_count]
+
+    # Y axis labels
+    for pct in [0, 25, 50, 75, 100]:
+        y_val  = int(max_wh * pct / 100)
+        y_row  = chart_bottom - int(chart_height * pct / 100)
+        if chart_top <= y_row <= chart_bottom:
+            label = f"{y_val:>5}Wh"
+            try:
+                win.addstr(y_row, 0, label, curses.color_pair(C_DIM))
+                win.addstr(y_row, chart_left - 1, "┤", curses.color_pair(C_DIM))
+            except curses.error:
+                pass
+
+    # Y axis line
+    for r in range(chart_top, chart_bottom + 1):
+        try:
+            win.addstr(r, chart_left - 1, "│", curses.color_pair(C_DIM))
+        except curses.error:
+            pass
+
+    # X axis line
+    try:
+        win.addstr(chart_bottom + 1, chart_left - 1,
+                   "└" + "─" * (chart_right - chart_left + 1),
+                   curses.color_pair(C_DIM))
+    except curses.error:
+        pass
+
+    # Bars — alternating colors for readability
+    for i, (day_offset, yield_wh, max_power) in enumerate(visible):
+        bar_h    = max(1, int(chart_height * yield_wh / max_wh)) if yield_wh > 0 else 0
+        bar_x    = chart_left + i * (bar_width + 1)
+        bar_attr = (curses.color_pair(C_VALUE) | curses.A_BOLD) if i % 2 == 0 \
+                   else (curses.color_pair(C_UPDATED) | curses.A_BOLD)
+
+        for r in range(bar_h):
+            bar_row = chart_bottom - r
+            if chart_top <= bar_row < chart_bottom + 1:
+                try:
+                    win.addstr(bar_row, bar_x, "█" * bar_width, bar_attr)
+                except curses.error:
+                    pass
+
+        # Day label under bar — show days ago
+        label = f"-{day_offset}d" if day_offset <= 9 else f"-{day_offset}"
+        try:
+            win.addstr(chart_bottom + 2, bar_x, label[:bar_width + 1],
+                       curses.color_pair(C_DIM))
+        except curses.error:
+            pass
+
+        # Value on top of bar if room
+        val_str = f"{yield_wh}Wh"
+        if bar_h >= 2 and bar_width >= len(val_str):
+            try:
+                win.addstr(chart_bottom - bar_h, bar_x, val_str,
+                           curses.color_pair(C_UPDATED))
+            except curses.error:
+                pass
+
+    # Title and age
+    age_str = f"  30-day yield history  |  " + \
+              (f"updated {time.time()-updated:.0f}s ago" if updated else "press R to load")
+    try:
+        win.addstr(2, 0, age_str[:cols], curses.color_pair(C_HEADER) | curses.A_BOLD)
+    except curses.error:
+        pass
+
+    try:
+        win.addstr(rows - 1, 0,
+                   " R:Refresh  Q:Quit  Tab/←→:Tabs "[:cols].ljust(cols),
+                   curses.color_pair(C_STATUS))
+    except curses.error:
+        pass
+
 
 # ─────────────────────────────────────────────
 #  Colour pairs
@@ -890,7 +1079,11 @@ def draw_settings_tab(win, state: State, addresses: list,
             value_str = "loading..."
             val_attr  = curses.color_pair(C_DIM)
         elif addr in cache:
-            value_str = cache[addr]
+            # Special display for Battery Type — show algorithm name
+            if addr == 0xEDF1:
+                value_str = get_battery_type_display(cache)
+            else:
+                value_str = cache[addr]
             val_attr  = curses.color_pair(C_VALUE) | curses.A_BOLD
             if v_range:
                 try:
@@ -1281,9 +1474,21 @@ def tui_main(stdscr, worker: SerialWorker, port: str):
             elif key == curses.KEY_RIGHT or key == ord('\t'):
                 active_tab = (active_tab + 1) % len(TABS)
                 num_buf = ""
+                if active_tab == 4 and not state.graph_data and not state.graph_loading:
+                    with state.lock:
+                        state.graph_loading = True
+                    threading.Thread(target=graph_fetch_thread,
+                                     args=(worker, state, stop_event),
+                                     daemon=True).start()
             elif key == curses.KEY_LEFT:
                 active_tab = (active_tab - 1) % len(TABS)
                 num_buf = ""
+                if active_tab == 4 and not state.graph_data and not state.graph_loading:
+                    with state.lock:
+                        state.graph_loading = True
+                    threading.Thread(target=graph_fetch_thread,
+                                     args=(worker, state, stop_event),
+                                     daemon=True).start()
             elif key == curses.KEY_DOWN and active_tab == 3:
                 tab_addrs   = TABS[3][2]
                 writable_ct = sum(1 for a in tab_addrs
@@ -1298,8 +1503,22 @@ def tui_main(stdscr, worker: SerialWorker, port: str):
                 if ch in TAB_KEYS:
                     active_tab = TAB_KEYS[ch]
                     num_buf = ""
+                    if active_tab == 4 and not state.graph_data and not state.graph_loading:
+                        with state.lock:
+                            state.graph_loading = True
+                        threading.Thread(target=graph_fetch_thread,
+                                         args=(worker, state, stop_event),
+                                         daemon=True).start()
                 elif ch == 'r' and active_tab != 0:
-                    fetch_tab(active_tab, force=True)
+                    if active_tab == 4:
+                        with state.lock:
+                            state.graph_data    = []
+                            state.graph_loading = True
+                        threading.Thread(target=graph_fetch_thread,
+                                         args=(worker, state, stop_event),
+                                         daemon=True).start()
+                    else:
+                        fetch_tab(active_tab, force=True)
                     num_buf = ""
                 elif active_tab == 3:  # Settings tab
                     if key in (curses.KEY_BACKSPACE, 127, 8):
@@ -1374,6 +1593,8 @@ def tui_main(stdscr, worker: SerialWorker, port: str):
                                       curses.color_pair(C_RW) | curses.A_BOLD)
                     except curses.error:
                         pass
+            elif active_tab == 4:
+                draw_graph_tab(stdscr, state, rows, cols)
             else:
                 draw_hex_tab(stdscr, state, tab_addrs, rows, cols)
 
