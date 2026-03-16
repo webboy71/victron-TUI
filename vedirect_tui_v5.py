@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 VE.Direct TUI — Victron MPPT terminal interface
-v2 — serialized serial access, live auto-refresh, ESC to cancel write
+v5 — Algorithm selector, chemistry protections, graph in History tab (G/B)
 
 Tabs:
   (L)ive     — refreshes from TEXT protocol stream
@@ -139,7 +139,6 @@ TABS = [
                        0xEDEA, 0xEDFB, 0xEDFC, 0xEDFD, 0xEDFE,
                        0xED2E, 0xEDA8, 0xEDA9, 0xEDAA,
                        0xEDEF]),
-    ("raph",    "G", []),   # daily yield bar chart — data fetched on demand
 ]
 TAB_KEYS = {t[1].lower(): i for i, t in enumerate(TABS)}
 
@@ -742,36 +741,38 @@ def auto_refetch_thread(worker: SerialWorker, state: State,
 def graph_fetch_thread(worker: SerialWorker, state: State,
                        stop_event: threading.Event):
     """
-    Fetches 30-day history from registers 0x104F (count) + 0x1050-0x106E.
-    Each day record is a 34-byte block. We extract yield (bytes 2-3, un16,
-    scale 10Wh) and max power (bytes 4-5, un16, scale 1W).
+    Fetches daily history from registers 0x1050 onwards.
+    Confirmed layout: byte[1]=yield×10Wh, byte[30]=max power W.
+    Re-pings every 5 registers to keep HEX mode alive.
+    0x1050 = today (may be incomplete), 0x1051 = yesterday, etc.
     """
     with state.lock:
         state.graph_loading = True
 
     worker.ping()
+    time.sleep(0.3)
     days = []
 
-    # Fetch up to 30 day records (0x1050 = today-1, 0x1051 = today-2, etc.)
-    for i in range(30):
+    for i in range(31):
         if stop_event.is_set():
             break
-        addr = 0x1050 + i
-        reg_lo = addr & 0xFF
-        reg_hi = (addr >> 8) & 0xFF
-        cs = (0x55 - (0x07 + reg_lo + reg_hi)) & 0xFF
-        frame = f":7{reg_lo:02X}{reg_hi:02X}{cs:02X}\n".encode()
 
-        worker.ping()
+        # Re-ping every 5 to keep HEX mode alive
+        if i > 0 and i % 5 == 0:
+            worker.ping()
+            time.sleep(0.2)
+
+        addr = 0x1050 + i
         val_bytes = worker.get_register(addr, retries=2)
 
-        if val_bytes is None or len(val_bytes) < 6:
-            break  # no more data
+        if val_bytes is None:
+            break   # no more data
+        if len(val_bytes) < 31:
+            continue  # short record, skip
 
-        # Parse day record: bytes 0-1 = day seq, 2-3 = yield (×10 Wh), 4-5 = max pwr (W)
-        yield_wh  = int.from_bytes(val_bytes[2:4], 'little') * 10
-        max_power = int.from_bytes(val_bytes[4:6], 'little')
-        days.append((i + 1, yield_wh, max_power))
+        yield_wh  = val_bytes[1] * 10   # byte[1] × 10Wh
+        max_power = val_bytes[30]        # byte[30] in W
+        days.append((i, yield_wh, max_power))
 
     with state.lock:
         state.graph_data    = days
@@ -779,8 +780,8 @@ def graph_fetch_thread(worker: SerialWorker, state: State,
         state.graph_updated = time.time()
 
 
-def draw_graph_tab(win, state: State, rows: int, cols: int):
-    """Draw a bar chart of daily yield (Wh) for up to 30 days."""
+def draw_graph_tab(win, state: State, rows: int, cols: int, start_row: int = 2):
+    """Draw a bar chart of daily yield (Wh). start_row allows embedding in History tab."""
     with state.lock:
         data    = list(state.graph_data)
         loading = state.graph_loading
@@ -788,59 +789,68 @@ def draw_graph_tab(win, state: State, rows: int, cols: int):
 
     if loading:
         try:
-            win.addstr(3, 2, "Loading 30-day history...", curses.color_pair(C_DIM))
+            win.addstr(start_row + 1, 2, "Loading history...",
+                       curses.color_pair(C_DIM))
         except curses.error:
             pass
         return
 
     if not data:
         try:
-            win.addstr(3, 2, "No history data. Press R to fetch.",
+            win.addstr(start_row + 1, 2, "No history data — press R to fetch",
                        curses.color_pair(C_DIM))
         except curses.error:
             pass
         return
 
+    # Title
+    age_str = "  Daily yield history  |  " + \
+              (f"updated {time.time()-updated:.0f}s ago" if updated else "press R to load")
+    try:
+        win.addstr(start_row, 0, age_str[:cols],
+                   curses.color_pair(C_HEADER) | curses.A_BOLD)
+    except curses.error:
+        pass
+
     # Chart dimensions
-    chart_top    = 3
-    chart_bottom = rows - 4
+    chart_top    = start_row + 1
+    chart_bottom = rows - 5
     chart_height = chart_bottom - chart_top
-    chart_left   = 8     # space for Y axis labels
+    chart_left   = 8
     chart_right  = cols - 2
     chart_width  = chart_right - chart_left
 
     if chart_height < 4 or chart_width < 10:
         return
 
-    # Find max value for scaling
-    max_wh = max(d[1] for d in data) if data else 1
-    if max_wh == 0:
-        max_wh = 1
+    # Skip today (index 0) if yield is 0 — it's incomplete
+    plot_data = data[1:] if data and data[0][1] == 0 else data
+    if not plot_data:
+        return
 
-    bar_count = min(len(data), chart_width // 3)
+    max_wh = max(d[1] for d in plot_data) or 1
+
+    bar_count = min(len(plot_data), chart_width // 3)
     bar_width = max(1, chart_width // bar_count - 1)
-    visible   = data[:bar_count]
+    visible   = plot_data[:bar_count]
 
     # Y axis labels
     for pct in [0, 25, 50, 75, 100]:
-        y_val  = int(max_wh * pct / 100)
-        y_row  = chart_bottom - int(chart_height * pct / 100)
+        y_val = int(max_wh * pct / 100)
+        y_row = chart_bottom - int(chart_height * pct / 100)
         if chart_top <= y_row <= chart_bottom:
-            label = f"{y_val:>5}Wh"
             try:
-                win.addstr(y_row, 0, label, curses.color_pair(C_DIM))
+                win.addstr(y_row, 0, f"{y_val:>5}Wh", curses.color_pair(C_DIM))
                 win.addstr(y_row, chart_left - 1, "┤", curses.color_pair(C_DIM))
             except curses.error:
                 pass
 
-    # Y axis line
+    # Axes
     for r in range(chart_top, chart_bottom + 1):
         try:
             win.addstr(r, chart_left - 1, "│", curses.color_pair(C_DIM))
         except curses.error:
             pass
-
-    # X axis line
     try:
         win.addstr(chart_bottom + 1, chart_left - 1,
                    "└" + "─" * (chart_right - chart_left + 1),
@@ -848,7 +858,7 @@ def draw_graph_tab(win, state: State, rows: int, cols: int):
     except curses.error:
         pass
 
-    # Bars — alternating colors for readability
+    # Bars
     for i, (day_offset, yield_wh, max_power) in enumerate(visible):
         bar_h    = max(1, int(chart_height * yield_wh / max_wh)) if yield_wh > 0 else 0
         bar_x    = chart_left + i * (bar_width + 1)
@@ -863,15 +873,15 @@ def draw_graph_tab(win, state: State, rows: int, cols: int):
                 except curses.error:
                     pass
 
-        # Day label under bar — show days ago
-        label = f"-{day_offset}d" if day_offset <= 9 else f"-{day_offset}"
+        # Day label
+        label = f"-{day_offset}d"
         try:
             win.addstr(chart_bottom + 2, bar_x, label[:bar_width + 1],
                        curses.color_pair(C_DIM))
         except curses.error:
             pass
 
-        # Value on top of bar if room
+        # Value on top if room
         val_str = f"{yield_wh}Wh"
         if bar_h >= 2 and bar_width >= len(val_str):
             try:
@@ -880,18 +890,10 @@ def draw_graph_tab(win, state: State, rows: int, cols: int):
             except curses.error:
                 pass
 
-    # Title and age
-    age_str = f"  30-day yield history  |  " + \
-              (f"updated {time.time()-updated:.0f}s ago" if updated else "press R to load")
+    # B to go back hint
     try:
-        win.addstr(2, 0, age_str[:cols], curses.color_pair(C_HEADER) | curses.A_BOLD)
-    except curses.error:
-        pass
-
-    try:
-        win.addstr(rows - 1, 0,
-                   " R:Refresh  Q:Quit  Tab/←→:Tabs "[:cols].ljust(cols),
-                   curses.color_pair(C_STATUS))
+        win.addstr(rows - 2, 2, "B:Back to history list  R:Refresh",
+                   curses.color_pair(C_DIM))
     except curses.error:
         pass
 
@@ -1417,10 +1419,11 @@ def tui_main(stdscr, worker: SerialWorker, port: str):
     stdscr.keypad(True)
     init_colours()
 
-    state      = State()
-    active_tab = 0
-    stop_event = threading.Event()
-    fetched    = set()
+    state             = State()
+    active_tab        = 0
+    stop_event        = threading.Event()
+    fetched           = set()
+    history_graph_mode = False   # True = show graph on History tab
 
     # TEXT live reader
     t_live = threading.Thread(target=live_reader_thread,
@@ -1473,22 +1476,12 @@ def tui_main(stdscr, worker: SerialWorker, port: str):
                 break
             elif key == curses.KEY_RIGHT or key == ord('\t'):
                 active_tab = (active_tab + 1) % len(TABS)
+                history_graph_mode = False
                 num_buf = ""
-                if active_tab == 4 and not state.graph_data and not state.graph_loading:
-                    with state.lock:
-                        state.graph_loading = True
-                    threading.Thread(target=graph_fetch_thread,
-                                     args=(worker, state, stop_event),
-                                     daemon=True).start()
             elif key == curses.KEY_LEFT:
                 active_tab = (active_tab - 1) % len(TABS)
+                history_graph_mode = False
                 num_buf = ""
-                if active_tab == 4 and not state.graph_data and not state.graph_loading:
-                    with state.lock:
-                        state.graph_loading = True
-                    threading.Thread(target=graph_fetch_thread,
-                                     args=(worker, state, stop_event),
-                                     daemon=True).start()
             elif key == curses.KEY_DOWN and active_tab == 3:
                 tab_addrs   = TABS[3][2]
                 writable_ct = sum(1 for a in tab_addrs
@@ -1502,15 +1495,11 @@ def tui_main(stdscr, worker: SerialWorker, port: str):
                 ch = chr(key).lower() if key < 256 else ''
                 if ch in TAB_KEYS:
                     active_tab = TAB_KEYS[ch]
+                    history_graph_mode = False
                     num_buf = ""
-                    if active_tab == 4 and not state.graph_data and not state.graph_loading:
-                        with state.lock:
-                            state.graph_loading = True
-                        threading.Thread(target=graph_fetch_thread,
-                                         args=(worker, state, stop_event),
-                                         daemon=True).start()
                 elif ch == 'r' and active_tab != 0:
-                    if active_tab == 4:
+                    if active_tab == 2 and history_graph_mode:
+                        # Refresh graph data
                         with state.lock:
                             state.graph_data    = []
                             state.graph_loading = True
@@ -1520,6 +1509,17 @@ def tui_main(stdscr, worker: SerialWorker, port: str):
                     else:
                         fetch_tab(active_tab, force=True)
                     num_buf = ""
+                elif ch == 'g' and active_tab == 2:
+                    # Switch History tab to graph view, fetch if needed
+                    history_graph_mode = True
+                    if not state.graph_data and not state.graph_loading:
+                        with state.lock:
+                            state.graph_loading = True
+                        threading.Thread(target=graph_fetch_thread,
+                                         args=(worker, state, stop_event),
+                                         daemon=True).start()
+                elif ch == 'b' and active_tab == 2 and history_graph_mode:
+                    history_graph_mode = False
                 elif active_tab == 3:  # Settings tab
                     if key in (curses.KEY_BACKSPACE, 127, 8):
                         num_buf = num_buf[:-1]
@@ -1583,6 +1583,16 @@ def tui_main(stdscr, worker: SerialWorker, port: str):
             tab_name, tab_key, tab_addrs = TABS[active_tab]
             if active_tab == 0:
                 draw_live_tab(stdscr, state, rows, cols)
+            elif active_tab == 2:
+                if history_graph_mode:
+                    draw_graph_tab(stdscr, state, rows, cols, start_row=2)
+                else:
+                    draw_hex_tab(stdscr, state, tab_addrs, rows, cols)
+                    try:
+                        stdscr.addstr(rows - 2, 2, "G:Graph view",
+                                      curses.color_pair(C_DIM))
+                    except curses.error:
+                        pass
             elif active_tab == 3:
                 draw_settings_tab(stdscr, state, tab_addrs, rows, cols,
                                   settings_cursor)
@@ -1593,8 +1603,6 @@ def tui_main(stdscr, worker: SerialWorker, port: str):
                                       curses.color_pair(C_RW) | curses.A_BOLD)
                     except curses.error:
                         pass
-            elif active_tab == 4:
-                draw_graph_tab(stdscr, state, rows, cols)
             else:
                 draw_hex_tab(stdscr, state, tab_addrs, rows, cols)
 
