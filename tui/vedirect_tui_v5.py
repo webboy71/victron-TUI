@@ -222,17 +222,31 @@ def get_system_voltage(hex_cache: dict) -> int:
     """Return system voltage (12 or 24) based on Battery V Setting register."""
     vset_str = hex_cache.get(0xEDEA, "")
     try:
-        vset = int(vset_str.split()[0])
-        if vset == 0:
+        # Handle values like "12V", "24 V", "Auto", "12", etc.
+        vset_str = vset_str.strip()
+        # Check for Auto first
+        if vset_str.lower() == "auto" or vset_str == "0":
             # AUTO - try to detect from battery voltage
             vbat_str = hex_cache.get(0xEDEF, "")
-            vbat = float(vbat_str.split()[0]) if vbat_str else 0
-            if vbat >= 20:
-                return 24
+            if vbat_str:
+                try:
+                    vbat = float(vbat_str.split()[0])
+                    if vbat >= 20:
+                        return 24
+                except (ValueError, IndexError):
+                    pass
             return 12
-        return vset
-    except (ValueError, IndexError):
-        return 12  # Default to 12V
+        # Try to extract numeric value
+        vset = int(float(vset_str.split()[0]))
+        if vset in (12, 24):
+            return vset
+        # If some other value, try to infer from it
+        if vset >= 20:
+            return 24
+        return 12
+    except (ValueError, IndexError, AttributeError):
+        # Default to 12V if we can't determine
+        return 12
 
 
 def get_current_algorithm(hex_cache: dict) -> Optional[Algorithm]:
@@ -1172,8 +1186,13 @@ def draw_settings_tab(win, state: State, addresses: list,
         selected = (kind == 'rw') and (num_label - 1 == cursor)
 
         if locked:
-            value_str = "n/a"
-            val_attr  = curses.color_pair(C_DIM)
+            # Show actual value even when locked, just with locked styling
+            if addr in cache:
+                value_str = cache[addr]
+                val_attr  = curses.color_pair(C_DIM) | curses.A_DIM
+            else:
+                value_str = "—"
+                val_attr  = curses.color_pair(C_DIM)
         elif addr in loading:
             value_str = "loading..."
             val_attr  = curses.color_pair(C_DIM)
