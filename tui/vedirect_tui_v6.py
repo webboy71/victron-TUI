@@ -222,8 +222,10 @@ def get_system_voltage(hex_cache: dict) -> int:
     """Return system voltage (12 or 24) based on Battery V Setting register."""
     vset_str = hex_cache.get(0xEDEA, "")
     try:
-        # Handle values like "12V", "24 V", "Auto", "12", etc.
+        # Handle values like "12V", "24 V", "Auto", "12", "24", etc.
         vset_str = vset_str.strip()
+        # Remove 'V' suffix if present
+        vset_str = vset_str.rstrip('V').strip()
         # Check for Auto first
         if vset_str.lower() == "auto" or vset_str == "0":
             # AUTO - try to detect from battery voltage
@@ -237,7 +239,7 @@ def get_system_voltage(hex_cache: dict) -> int:
                     pass
             return 12
         # Try to extract numeric value
-        vset = int(float(vset_str.split()[0]))
+        vset = int(float(vset_str))
         if vset in (12, 24):
             return vset
         # If some other value, try to infer from it
@@ -319,7 +321,12 @@ def get_battery_type_display(hex_cache: dict) -> str:
             7: "PzS traction / OPzS (high)",
             8: "LiFePO4",
         }
-        return ALG_NAMES.get(btype, f"Preset {btype}")
+        name = ALG_NAMES.get(btype, f"Preset {btype}")
+        # If it's "User defined" (btype=0), we need to show it properly
+        # Don't fall through to voltage detection for btype=0
+        if btype == 0:
+            return name
+        return name
 
     # Type 255 = user defined — infer from voltages
     alg = get_current_algorithm(hex_cache)
@@ -418,14 +425,19 @@ class SerialWorker:
         return result.get('ok', False), result.get('flags')
 
     def nvm_save(self) -> bool:
-        # NVM save may need multiple attempts and extra pings
-        for attempt in range(3):
+        # NVM save needs extra care - ping first, wait, then save
+        for attempt in range(5):
+            # Ping to keep HEX session alive
             self.ping()
-            time.sleep(0.2)
+            time.sleep(0.5)
+            
+            # Try to save
             ok, flags = self.set_register(0xEB99, 1, size=1)
             if ok:
                 return True
-            time.sleep(0.5)
+            
+            # Wait before retry
+            time.sleep(1.0)
         return False
 
     # ── internal ────────────────────────────
