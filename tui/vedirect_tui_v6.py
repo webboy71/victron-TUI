@@ -112,7 +112,8 @@ REGISTERS = [
     Register(0xEDF6, "Float Voltage",      "Float phase target voltage",           "V",    0.01,  "RW", "d", 2),
     Register(0xEDF7, "Absorption Voltage", "Absorption phase target voltage",      "V",    0.01,  "RW", "d", 2),
     Register(0xEDEF, "Battery Voltage",    "System battery voltage (operational)", "V",    1,     "R",  "d", 1),
-    Register(0xEDEA, "Battery V Setting",  "Battery voltage setting (0=AUTO)",     "V",    1,     "RW", "d", 1),
+    Register(0xEDEA, "Battery V Setting",  "Battery voltage setting (0=AUTO, 12=12V, 24=24V)", "V", 1, "RW", "d", 1,
+             {0:"Auto", 12:"12V", 24:"24V"}),
     Register(0xEDFB, "Absorption Time",    "Max absorption time",                  "h",    0.01,  "RW", "d", 2),
     Register(0xEDFC, "Bulk Time Limit",    "Maximum bulk charge time",             "h",    0.01,  "RW", "d", 2),
     Register(0xEDFD, "Auto Equalise",      "Auto equalisation interval (0=off)",   "days", 1,     "RW", "d", 1),
@@ -201,6 +202,9 @@ LITHIUM_LOCKED = {
     0xEDFE,   # Adaptive Mode  (should be fixed time for LiFePO4)
 }
 
+# Battery V Setting - locked to 12 or 24 only
+BATTERY_V_SETTINGS = {12, 24}
+
 # Safe voltage ranges per register for LiFePO4 (min, max) in display units
 LITHIUM_RANGES = {
     0xEDF7: (14.0, 14.6),   # Absorption Voltage
@@ -213,6 +217,23 @@ LEADACID_RANGES = {
     0xEDF6: (12.5, 14.5),   # Float Voltage
     0xEDF4: (14.0, 17.5),   # Equalise Voltage
 }
+
+def get_system_voltage(hex_cache: dict) -> int:
+    """Return system voltage (12 or 24) based on Battery V Setting register."""
+    vset_str = hex_cache.get(0xEDEA, "")
+    try:
+        vset = int(vset_str.split()[0])
+        if vset == 0:
+            # AUTO - try to detect from battery voltage
+            vbat_str = hex_cache.get(0xEDEF, "")
+            vbat = float(vbat_str.split()[0]) if vbat_str else 0
+            if vbat >= 20:
+                return 24
+            return 12
+        return vset
+    except (ValueError, IndexError):
+        return 12  # Default to 12V
+
 
 def get_current_algorithm(hex_cache: dict) -> Optional[Algorithm]:
     """
@@ -290,20 +311,37 @@ def get_battery_type_display(hex_cache: dict) -> str:
 
 def is_register_locked(addr: int, alg: Optional[Algorithm]) -> bool:
     """Return True if this register should be blocked for the current algorithm."""
+    # Battery V Setting is locked (must use algorithm selector to change)
+    # Users can only change via algorithm presets
+    if addr == 0xEDEA:
+        return True
     if alg is None or alg.is_custom:
         return False
     if alg.is_lithium and addr in LITHIUM_LOCKED:
         return True
     return False
 
-def get_range_for_register(addr: int, alg: Optional[Algorithm]) -> Optional[tuple]:
-    """Return (min, max) safety range for a register given current algorithm, or None."""
+def get_range_for_register(addr: int, alg: Optional[Algorithm], system_voltage: int = 12) -> Optional[tuple]:
+    """Return (min, max) safety range for a register given current algorithm and system voltage."""
+    # Battery V Setting is locked to 12 or 24 only
+    if addr == 0xEDEA:
+        return (12, 24)
+    
+    # Get base ranges
     if alg is None or alg.is_custom:
         return None
     if alg.is_lithium:
-        return LITHIUM_RANGES.get(addr)
+        ranges = LITHIUM_RANGES.get(addr)
     else:
-        return LEADACID_RANGES.get(addr)
+        ranges = LEADACID_RANGES.get(addr)
+    
+    if ranges is None:
+        return None
+    
+    # Scale ranges for 24V systems (ranges are defined for 12V)
+    if system_voltage == 24:
+        return (ranges[0] * 2, ranges[1] * 2)
+    return ranges
 
 # ─────────────────────────────────────────────
 #  Serial access — single worker thread
@@ -1055,20 +1093,25 @@ def draw_settings_tab(win, state: State, addresses: list,
         log     = list(state.write_log)
 
     alg = get_current_algorithm(cache)
+    system_v = get_system_voltage(cache)
+    voltage_factor = system_v // 12
 
     # ── Algorithm banner ──────────────────────
     if alg is not None:
+        abs_v = alg.absorption * voltage_factor
+        float_v = alg.float_v * voltage_factor
+        eq_v = alg.equalize * voltage_factor if alg.equalize else 0
         if alg.is_lithium:
-            banner = f"  ⚡ LiFePO4  |  Eq and temp comp N/A  |  Abs {alg.absorption}V  Float {alg.float_v}V"
+            banner = f"  ⚡ {system_v}V  |  LiFePO4  |  Abs {abs_v}V  Float {float_v}V"
             ban_attr = curses.color_pair(C_UPDATED) | curses.A_BOLD
         elif alg.is_custom:
-            banner = f"  ⚙  Custom / User Defined  |  All parameters user-configurable"
+            banner = f"  ⚙  {system_v}V  |  Custom / User Defined  |  All parameters user-configurable"
             ban_attr = curses.color_pair(C_DIM)
         else:
-            banner = f"  ● Pos {alg.position}: {alg.name}  |  Abs {alg.absorption}V  Float {alg.float_v}V  Eq {alg.equalize}V @ {alg.eq_current}%"
+            banner = f"  ● {system_v}V  |  Pos {alg.position}: {alg.name}  |  Abs {abs_v}V  Float {float_v}V  Eq {eq_v}V @ {alg.eq_current}%"
             ban_attr = curses.color_pair(C_HEADER)
     else:
-        banner = "  Algorithm: detecting..."
+        banner = f"  {system_v}V  |  Algorithm: detecting..."
         ban_attr = curses.color_pair(C_DIM)
     try:
         win.addstr(2, 0, banner[:cols].ljust(cols), ban_attr)
@@ -1106,7 +1149,7 @@ def draw_settings_tab(win, state: State, addresses: list,
         _, num_label, addr = row
         reg     = REG_BY_ADDR[addr]
         locked  = is_register_locked(addr, alg)
-        v_range = get_range_for_register(addr, alg)
+        v_range = get_range_for_register(addr, alg, system_v)
         selected = (kind == 'rw') and (num_label - 1 == cursor)
 
         if locked:
@@ -1233,8 +1276,9 @@ def edit_register(stdscr, worker: SerialWorker, state: State,
     with state.lock:
         cache = dict(state.hex_cache)
     alg     = get_current_algorithm(cache)
+    system_v = get_system_voltage(cache)
     locked  = is_register_locked(addr, alg)
-    v_range = get_range_for_register(addr, alg)
+    v_range = get_range_for_register(addr, alg, system_v)
 
     curses.endwin()
 
@@ -1339,19 +1383,48 @@ def edit_register(stdscr, worker: SerialWorker, state: State,
 def algorithm_selector(stdscr, worker: SerialWorker, state: State):
     """Apply a preset charging algorithm to the controller."""
     curses.endwin()
+    
+    # Get current system voltage
+    with state.lock:
+        cache = dict(state.hex_cache)
+    system_v = get_system_voltage(cache)
+    
+    # Ask for voltage selection first
     print(f"\n\033[1;36m─── Algorithm Selector ───────────────────────────────────\033[0m")
+    print(f"  Current System Voltage: {system_v}V")
+    print(f"  Select system voltage: 1 = 12V, 2 = 24V")
+    inp = raw_input("  (or press Enter to keep current): ")
+    if inp and inp.strip() in ('1', '2'):
+        new_v = 12 if inp.strip() == '1' else 24
+        if new_v != system_v:
+            # Write new voltage setting
+            REG_BATTERY_V = Register(0xEDEA, "Battery V Setting", "", "", 1, "RW", "d", 1)
+            worker.ping()
+            ok, flags = worker.set_register(REG_BATTERY_V.address, new_v, size=1)
+            if ok:
+                print(f"  \033[32mSet to {new_v}V\033[0m")
+                system_v = new_v
+            else:
+                print(f"  \033[31mFailed to set voltage\033[0m")
+                time.sleep(1.5)
+                return
+    print()
     print(f"  {'#':<4} {'Name':<38} {'Abs':>6} {'Float':>6} {'Eq':>7} {'Eq%':>4} {'Temp':>6}")
     print(f"  {'─'*74}")
     for alg in ALGORITHMS:
         if alg.is_custom:
             print(f"  {alg.position:<4} \033[2m{alg.name:<38}\033[0m  (manual edit only)")
         else:
-            eq_str  = "  n/a" if alg.equalize == 0  else f"{alg.equalize:>5}V"
+            # Scale voltages for system voltage
+            abs_v = alg.absorption * (system_v // 12)
+            float_v = alg.float_v * (system_v // 12)
+            eq_v = alg.equalize * (system_v // 12) if alg.equalize else 0
+            eq_str  = "  n/a" if eq_v == 0  else f"{eq_v:>5}V"
             eqp_str = " n/a" if alg.eq_current == 0 else f"{alg.eq_current:>3}%"
             tc_str  = "   0" if alg.temp_comp == 0   else f"{alg.temp_comp:>4}"
             marker  = " \033[33m← LiFePO4\033[0m" if alg.is_lithium else ""
             print(f"  {alg.position:<4} {alg.name:<38} "
-                  f"{alg.absorption:>5}V {alg.float_v:>5}V "
+                  f"{abs_v:>5}V {float_v:>5}V "
                   f"{eq_str} {eqp_str} {tc_str}{marker}")
     print()
     print(f"  \033[33mNote: This writes absorption, float, temp compensation and\033[0m")
@@ -1378,11 +1451,17 @@ def algorithm_selector(stdscr, worker: SerialWorker, state: State):
         time.sleep(1.5)
         return
 
-    print(f"\n  Will apply: \033[1m{alg.name}\033[0m")
-    print(f"    Absorption voltage : {alg.absorption} V")
-    print(f"    Float voltage      : {alg.float_v} V")
-    if alg.equalize > 0:
-        print(f"    Equalise voltage   : {alg.equalize} V")
+    # Scale voltages for system voltage
+    voltage_factor = system_v // 12
+    abs_v = alg.absorption * voltage_factor
+    float_v = alg.float_v * voltage_factor
+    eq_v = alg.equalize * voltage_factor if alg.equalize else 0
+    
+    print(f"\n  Will apply: \033[1m{alg.name}\033[0m @ {system_v}V")
+    print(f"    Absorption voltage : {abs_v} V")
+    print(f"    Float voltage      : {float_v} V")
+    if eq_v > 0:
+        print(f"    Equalise voltage   : {eq_v} V")
     else:
         print(f"    Equalise voltage   : n/a (not written)")
     print(f"    Temp compensation  : {alg.temp_comp} mV/°C")
@@ -1396,20 +1475,28 @@ def algorithm_selector(stdscr, worker: SerialWorker, state: State):
         return
 
     REG_BATTERY_TYPE  = Register(0xEDF1, "Battery Type", "", "", 1, "RW", "d", 1)
+    REG_BATTERY_V     = Register(0xEDEA, "Battery V Setting", "", "", 1, "RW", "d", 1)
     REG_ABSORPTION    = Register(0xEDF7, "Absorption Voltage", "", "", 0.01, "RW", "d", 2)
     REG_FLOAT         = Register(0xEDF6, "Float Voltage", "", "", 0.01, "RW", "d", 2)
     REG_EQUALIZE      = Register(0xEDF4, "Equalise Voltage", "", "", 0.01, "RW", "d", 2)
     REG_TEMP_COMP     = Register(0xEDF2, "Temp Compensation", "", "", 0.01, "RW", "d", 2)
 
     # Set battery type to match algorithm position (not 255 = user defined)
+    # Scale voltages for system voltage
+    voltage_factor = system_v // 12
+    abs_raw = round(abs_v / 0.01)
+    float_raw = round(float_v / 0.01)
+    eq_raw = round(eq_v / 0.01) if eq_v > 0 else 0
+    
     writes = [
+        (REG_BATTERY_V,     system_v, f"System Voltage = {system_v}V"),
         (REG_BATTERY_TYPE, alg.position, f"Battery Type = {alg.name}"),
-        (REG_ABSORPTION,   round(alg.absorption / 0.01), f"Absorption = {alg.absorption}V"),
-        (REG_FLOAT,        round(alg.float_v / 0.01),    f"Float = {alg.float_v}V"),
+        (REG_ABSORPTION,   abs_raw, f"Absorption = {abs_v}V"),
+        (REG_FLOAT,        float_raw,    f"Float = {float_v}V"),
         (REG_TEMP_COMP,    round(alg.temp_comp / 0.01) & 0xFFFF, f"Temp comp = {alg.temp_comp} mV/°C"),
     ]
-    if alg.equalize > 0:
-        writes.append((REG_EQUALIZE, round(alg.equalize / 0.01), f"Equalise = {alg.equalize}V"))
+    if eq_raw > 0:
+        writes.append((REG_EQUALIZE, eq_raw, f"Equalise = {eq_v}V"))
 
     all_ok = True
     for reg_obj, raw_val, desc in writes:
