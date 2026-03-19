@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 VE.Direct TUI — Victron MPPT terminal interface
-v5 — Algorithm selector, chemistry protections, graph in History tab (G/B)
+v6 — Improved graph fetching (more days, better timeout/retry), green gradient bars
 
 Tabs:
   (L)ive     — refreshes from TEXT protocol stream
