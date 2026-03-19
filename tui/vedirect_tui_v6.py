@@ -246,8 +246,12 @@ def get_current_algorithm(hex_cache: dict) -> Optional[Algorithm]:
     btype_str = hex_cache.get(0xEDF1, "")
     try:
         btype = int(btype_str.split()[0])
-        if 0 <= btype <= 8:
-            return ALG_BY_POS.get(btype)
+        # Register values 1-8 map to algorithm positions 0-7
+        # Register value 0 = User defined (not an algorithm)
+        # Register value 255 = User defined (custom)
+        if 1 <= btype <= 8:
+            alg_pos = btype - 1  # Convert register value to algorithm position
+            return ALG_BY_POS.get(alg_pos)
     except (ValueError, IndexError):
         pass
 
@@ -288,16 +292,18 @@ def get_battery_type_display(hex_cache: dict) -> str:
         return btype_str
 
     if btype != 255:
-        # Rotary switch preset — map to algorithm name
+        # Battery type register - map to algorithm name
+        # Register 0xEDF1 choices: 0=User defined, 1-8 are presets
         ALG_NAMES = {
-            0: "Gel long life / OPzV",
-            1: "Gel / AGM deep discharge",
-            2: "Default / Gel / AGM DD",
-            3: "AGM spiral / OPzS",
-            4: "PzS traction / OPzS (low)",
-            5: "PzS traction / OPzS (mid)",
-            6: "PzS traction / OPzS (high)",
-            7: "LiFePO4",
+            0: "User defined",
+            1: "Gel long life / OPzV",
+            2: "Gel / AGM deep discharge",
+            3: "Default / Gel / AGM DD",
+            4: "AGM spiral / OPzS",
+            5: "PzS traction / OPzS (low)",
+            6: "PzS traction / OPzS (mid)",
+            7: "PzS traction / OPzS (high)",
+            8: "LiFePO4",
         }
         return ALG_NAMES.get(btype, f"Preset {btype}")
 
@@ -398,8 +404,15 @@ class SerialWorker:
         return result.get('ok', False), result.get('flags')
 
     def nvm_save(self) -> bool:
-        ok, _ = self.set_register(0xEB99, 1, size=1)
-        return ok
+        # NVM save may need multiple attempts and extra pings
+        for attempt in range(3):
+            self.ping()
+            time.sleep(0.2)
+            ok, flags = self.set_register(0xEB99, 1, size=1)
+            if ok:
+                return True
+            time.sleep(0.5)
+        return False
 
     # ── internal ────────────────────────────
 
@@ -1490,7 +1503,8 @@ def algorithm_selector(stdscr, worker: SerialWorker, state: State):
     
     writes = [
         (REG_BATTERY_V,     system_v, f"System Voltage = {system_v}V"),
-        (REG_BATTERY_TYPE, alg.position, f"Battery Type = {alg.name}"),
+        # Register value = algorithm position + 1 (position 0 = register 1, etc.)
+        (REG_BATTERY_TYPE, alg.position + 1, f"Battery Type = {alg.name}"),
         (REG_ABSORPTION,   abs_raw, f"Absorption = {abs_v}V"),
         (REG_FLOAT,        float_raw,    f"Float = {float_v}V"),
         (REG_TEMP_COMP,    round(alg.temp_comp / 0.01) & 0xFFFF, f"Temp comp = {alg.temp_comp} mV/°C"),
