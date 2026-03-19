@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 VE.Direct TUI — Victron MPPT terminal interface
-v6 — Improved graph fetching (more days, better timeout/retry), green gradient bars
+v6 — Algorithm selector sets battery type to match preset (not user defined)
 
 Tabs:
   (L)ive     — refreshes from TEXT protocol stream
@@ -217,9 +217,20 @@ LEADACID_RANGES = {
 def get_current_algorithm(hex_cache: dict) -> Optional[Algorithm]:
     """
     Infer current algorithm from cached register values.
-    Matches absorption and float voltages against known presets.
-    Returns Custom if no match found.
+    First checks battery type register - if set to a preset (0-8), use that.
+    Otherwise matches absorption and float voltages against known presets.
+    Returns Custom only if no match found.
     """
+    # First check battery type register
+    btype_str = hex_cache.get(0xEDF1, "")
+    try:
+        btype = int(btype_str.split()[0])
+        if 0 <= btype <= 8:
+            return ALG_BY_POS.get(btype)
+    except (ValueError, IndexError):
+        pass
+
+    # If battery type is 255 (user defined), infer from voltages
     abs_str   = hex_cache.get(0xEDF7, "")
     float_str = hex_cache.get(0xEDF6, "")
 
@@ -258,14 +269,14 @@ def get_battery_type_display(hex_cache: dict) -> str:
     if btype != 255:
         # Rotary switch preset — map to algorithm name
         ALG_NAMES = {
-            1: "Pos 0: Gel long life / OPzV",
-            2: "Pos 1: Gel / AGM deep discharge",
-            3: "Pos 2: Default / Gel / AGM DD",
-            4: "Pos 3: AGM spiral / OPzS",
-            5: "Pos 4: PzS traction / OPzS (low)",
-            6: "Pos 5: PzS traction / OPzS (mid)",
-            7: "Pos 6: PzS traction / OPzS (high)",
-            8: "Pos 7: LiFePO4",
+            0: "Gel long life / OPzV",
+            1: "Gel / AGM deep discharge",
+            2: "Default / Gel / AGM DD",
+            3: "AGM spiral / OPzS",
+            4: "PzS traction / OPzS (low)",
+            5: "PzS traction / OPzS (mid)",
+            6: "PzS traction / OPzS (high)",
+            7: "LiFePO4",
         }
         return ALG_NAMES.get(btype, f"Preset {btype}")
 
@@ -1345,7 +1356,7 @@ def algorithm_selector(stdscr, worker: SerialWorker, state: State):
     print()
     print(f"  \033[33mNote: This writes absorption, float, temp compensation and\033[0m")
     print(f"  \033[33mequalise voltage to the controller as a starting point.\033[0m")
-    print(f"  \033[33mBattery type is set to User Defined (0xFF) to allow editing.\033[0m")
+    print(f"  \033[33mBattery type is set to match the selected preset.\033[0m")
     print()
 
     inp = raw_input("  Select algorithm 0–8 (ESC to cancel): ")
@@ -1375,7 +1386,7 @@ def algorithm_selector(stdscr, worker: SerialWorker, state: State):
     else:
         print(f"    Equalise voltage   : n/a (not written)")
     print(f"    Temp compensation  : {alg.temp_comp} mV/°C")
-    print(f"    Battery type       : User Defined (0xFF)")
+    print(f"    Battery type       : {alg.name} (preset {alg.position})")
     print()
 
     confirm = raw_input("  Type Y to apply this algorithm, any other key cancels: ")
@@ -1390,8 +1401,9 @@ def algorithm_selector(stdscr, worker: SerialWorker, state: State):
     REG_EQUALIZE      = Register(0xEDF4, "Equalise Voltage", "", "", 0.01, "RW", "d", 2)
     REG_TEMP_COMP     = Register(0xEDF2, "Temp Compensation", "", "", 0.01, "RW", "d", 2)
 
+    # Set battery type to match algorithm position (not 255 = user defined)
     writes = [
-        (REG_BATTERY_TYPE, 255, "Battery Type = User Defined"),
+        (REG_BATTERY_TYPE, alg.position, f"Battery Type = {alg.name}"),
         (REG_ABSORPTION,   round(alg.absorption / 0.01), f"Absorption = {alg.absorption}V"),
         (REG_FLOAT,        round(alg.float_v / 0.01),    f"Float = {alg.float_v}V"),
         (REG_TEMP_COMP,    round(alg.temp_comp / 0.01) & 0xFFFF, f"Temp comp = {alg.temp_comp} mV/°C"),
